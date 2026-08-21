@@ -236,6 +236,8 @@ static float g_pathDist      = 2000.0f; // (느슨한 상한) 경로선분과 �
 static float g_openThreshold = 0.9f;    // 열림량이 이 미만이면 "닫힘". 재발행 문턱이기도 하다 —
                                         // 0.5 는 열리는 중에 재발행이 붙어 개방을 끊었다(문만 열고 정지). 실측 0.9 무결점.
 // v3-b 자동 닫기
+static bool  g_respectLocked = false;   // 1이면 잠긴 문은 열지 않는다 (닫힘만 자동 통과).
+                                        // 잠금을 "통과 금지" 표시로 쓰고 싶을 때 켠다.
 static bool  g_autoClose     = true;    // 우리가 연 문을 사람이 없어지면 닫는다
 static float g_closeRadius   = 110.0f;   // 이 반경에 아군이 없으면 "비었다" (경비 위치는 이 밖에)
                                         // (0 이어도 동물은 제자리 대기하다 문이 열리면 엔진이 자동 재개한다 — 실측)
@@ -723,6 +725,14 @@ static bool SafeAddDoorOrder(void* ch, int task, void* subject)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+
+// 잠금 상태 조회 (후보 선정용). 실패하면 "모른다"로 보고 -1.
+static int SafeIsLocked(void* door)
+{
+    __try { return ((DoorStuff*)door)->isLocked() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 static float SafeOpenAmount(void* door)
 {
     __try { return ((DoorStuff*)door)->getDoorOpenAmount(); }
@@ -799,6 +809,11 @@ static void DetectAndQueue(void* ch, float cx, float cy, float cz,
         float oa = SafeOpenAmount(d->ptr);
         if (oa < 0.0f) continue;                  // 조회 실패 — 죽은 항목일 수 있다
         if (oa >= g_openThreshold) continue;      // 이미 열린 문은 막는 게 아니다
+
+        // respectLocked: 잠긴 문은 "여긴 통과 금지"라는 플레이어의 표시로 본다.
+        // 닫아만 두면 자동으로 열고 지나가고, 잠그면 우리도 손대지 않는다.
+        // (창작마당 요청: 잠금이 아군·적 모두를 막는 최종 통제 수단이어야 한다)
+        if (g_respectLocked && SafeIsLocked(d->ptr) == 1) continue;
 
         float detour = Dist2D(cx, cz, d->x, d->z) + Dist2D(d->x, d->z, dx, dz);
         float extra  = detour - direct;
@@ -1545,6 +1560,7 @@ static void LoadConfig()
         else if (strcmp(key, "injectDelay")   == 0) g_injectDelay   = val;
         else if (strcmp(key, "moveEps")       == 0) g_moveEps       = val;
         else if (strcmp(key, "autoClose")     == 0) g_autoClose     = (val != 0.0f);
+        else if (strcmp(key, "respectLocked") == 0) g_respectLocked = (val != 0.0f);
         else if (strcmp(key, "closeRadius")   == 0) g_closeRadius   = val;
         else if (strcmp(key, "closeDelay")    == 0) g_closeDelay    = val;
         else if (strcmp(key, "closeGrace")    == 0) g_closeGrace    = val;
@@ -1565,6 +1581,7 @@ static void WriteConfigSnapshot()
     fprintf(f, "pathDist=%.0f   # (폴백) 측면 판정이 못 고를 때만 쓰는 선분 거리 상한.\n", g_pathDist);
     fprintf(f, "maxDetour=%.0f    # 이 문을 거치느라 더 걷는 거리 한도. 이보다 크면 무관한 문으로 본다.\n", g_maxDetour);
     fprintf(f, "autoClose=%d    # 우리가 연 문을 사람이 없어지면 자동으로 닫고 원래 잠금 상태로 되돌린다.\n", g_autoClose ? 1 : 0);
+    fprintf(f, "respectLocked=%d    # 1이면 잠긴 게이트는 열지 않는다. 닫아만 둔 문은 그대로 자동 통과.\n", g_respectLocked ? 1 : 0);
     fprintf(f, "closeRadius=%.0f    # 이 반경에 아군이 없으면 비었다고 본다. 경비는 이 밖에 세워라.\n", g_closeRadius);
     fprintf(f, "closeDelay=%.0f    # 비어 있는 상태가 이만큼 지속되면 닫는다(초).\n", g_closeDelay);
     fprintf(f, "closeGrace=%.0f    # 마지막 통과 시작 후 이만큼은 무조건 안 닫는다(초).\n", g_closeGrace);
@@ -1604,9 +1621,9 @@ static void CheckConfigReload()
     LoadConfig();
     if (g_logLimit < 0) g_logLimit = 400;
     // 전문 출력 — 시작 로그와 같은 형식. 어느 값이 실제로 반영됐는지 눈으로 확인한다.
-    Log(LC_INIT, "[cfg 재적용] debug=%d verbose=%d logLimit=%d | enabled=%d maxDetour=%.0f pathDist=%.0f openThreshold=%.2f autoClose=%d closeRadius=%.0f closeDelay=%.0f closeGrace=%.0f pendingWait=%.0f injectDelay=%.1f moveEps=%.1f arriveEps=%.1f",
+    Log(LC_INIT, "[cfg 재적용] debug=%d verbose=%d logLimit=%d | enabled=%d maxDetour=%.0f pathDist=%.0f openThreshold=%.2f respectLocked=%d autoClose=%d closeRadius=%.0f closeDelay=%.0f closeGrace=%.0f pendingWait=%.0f injectDelay=%.1f moveEps=%.1f arriveEps=%.1f",
         g_debug ? 1 : 0, g_verbose ? 1 : 0, g_logLimit,
-        g_enabled ? 1 : 0, g_maxDetour, g_pathDist, g_openThreshold,
+        g_enabled ? 1 : 0, g_maxDetour, g_pathDist, g_openThreshold, g_respectLocked ? 1 : 0,
         g_autoClose ? 1 : 0, g_closeRadius, g_closeDelay, g_closeGrace, g_pendingWait,
         g_injectDelay, g_moveEps, g_arriveEps);
 }
@@ -1633,10 +1650,10 @@ void startPlugin()
     if (g_logLimit < 0) g_logLimit = 400;
     WriteConfigSnapshot();
 
-    Log(LC_INIT, "GateFix 시작 (v3 — 게이트 자동 개방·자동 닫기 (상용))");
-    Log(LC_INIT, "  debug=%d verbose=%d logLimit=%d | enabled=%d maxDetour=%.0f pathDist=%.0f(상한) openThreshold=%.2f autoClose=%d closeRadius=%.0f closeDelay=%.0f closeGrace=%.0f pendingWait=%.0f injectDelay=%.1f moveEps=%.1f arriveEps=%.1f",
+    Log(LC_INIT, "GateFix 시작 (v3.1 — 잠긴 게이트 존중 옵션 추가 (respectLocked))");
+    Log(LC_INIT, "  debug=%d verbose=%d logLimit=%d | enabled=%d maxDetour=%.0f pathDist=%.0f(상한) openThreshold=%.2f respectLocked=%d autoClose=%d closeRadius=%.0f closeDelay=%.0f closeGrace=%.0f pendingWait=%.0f injectDelay=%.1f moveEps=%.1f arriveEps=%.1f",
         g_debug ? 1 : 0, g_verbose ? 1 : 0, g_logLimit,
-        g_enabled ? 1 : 0, g_maxDetour, g_pathDist, g_openThreshold,
+        g_enabled ? 1 : 0, g_maxDetour, g_pathDist, g_openThreshold, g_respectLocked ? 1 : 0,
         g_autoClose ? 1 : 0, g_closeRadius, g_closeDelay, g_closeGrace, g_pendingWait,
         g_injectDelay, g_moveEps, g_arriveEps);
 

@@ -540,6 +540,8 @@ public:
     {
     public:
         float maxHealth() const;   // ?maxHealth@HealthPartStatus@MedicalSystem@@QEBAMXZ
+        // ?isRobotic@HealthPartStatus@MedicalSystem@@QEAA_NXZ — 이 부위가 로봇인가
+        bool  isRobotic();
     };
 
     bool  isFullyRested() const;          // ?isFullyRested@MedicalSystem@@QEBA_NXZ
@@ -619,6 +621,14 @@ static bool  g_probeOrder = false;  // v33: 우클릭 명령의 전 인자와 �
 static int   g_probeLines = 0;
 static bool  g_autoBedOrder = true;  // v34: 다친 아군에게 침대 명령을 대신 낸다.
                                       // 상시 잡 보유자도 눕는다. v38 부터 기본 켬.
+static float g_stuckRelease   = 300.0f;  // v40: 침대에서 이만큼(초) 회복이 없으면 놓아준다. 0=끔
+static bool  g_ignoreRobotParts = true;  // v40: 회복 판정에서 로봇 부위를 뺀다.
+                                         // 로봇은 수리 대상이지 취침 대상이 아니다.
+static bool  g_respectMoveOrder = true;  // v39: 플레이어가 낸 이동 명령이 진행 중이면
+                                         // 침대 명령을 내지 않는다. 창작마당 신고:
+                                         // 전투 후 이동시키면 부상자가 자꾸 침대로 돌아간다
+                                         // (광클해야 겨우 움직인다). 원인은 선택이 풀린 뒤
+                                         // 쿨다운마다 침대 명령이 이동 명령을 덮은 것.
 static int   g_bedOrderCooldownMs = 15000;  // 같은 사람에게 다시 낼 때까지 최소 간격.
                                       // 짧으면 경로탐색이 계속 초기화돼 출발을 못 한다
                                       // (WASD 소스가 경고한 never-starts stutter).
@@ -757,6 +767,9 @@ static void LoadConfig()
         else if (strcmp(key, "probeOrder")    == 0) g_probeOrder    = (val != 0.0f);
         else if (strcmp(key, "autoBedOrder")  == 0) g_autoBedOrder  = (val != 0.0f);
         else if (strcmp(key, "bedOrderCooldownMs") == 0) g_bedOrderCooldownMs = (int)val;
+        else if (strcmp(key, "respectMoveOrder") == 0) g_respectMoveOrder = (val != 0.0f);
+        else if (strcmp(key, "ignoreRobotParts") == 0) g_ignoreRobotParts = (val != 0.0f);
+        else if (strcmp(key, "stuckRelease")    == 0) g_stuckRelease    = val;
         else if (strcmp(key, "logLimit")      == 0) g_logLimit      = (int)val;
         else if (strcmp(key, "healThreshold") == 0) g_healThreshold = val;
         else if (strcmp(key, "forceBed")      == 0) g_forceBed      = val;
@@ -798,8 +811,8 @@ static void CheckConfigReload()
     lastMtime = u.QuadPart;
 
     LoadConfig();   // 클램프 포함 (위 함수 안에 있다). 스냅샷은 다시 쓰지 않는다.
-    Log(LC_INIT, "[cfg 재적용] autoBedOrder=%d bedOrderCooldownMs=%d healThreshold=%.2f stayInBed=%d clearBedOrder=%d skipCombat=%d",
-        g_autoBedOrder ? 1 : 0, g_bedOrderCooldownMs, g_healThreshold,
+    Log(LC_INIT, "[cfg 재적용] autoBedOrder=%d respectMoveOrder=%d bedOrderCooldownMs=%d healThreshold=%.2f stayInBed=%d clearBedOrder=%d skipCombat=%d",
+        g_autoBedOrder ? 1 : 0, g_respectMoveOrder ? 1 : 0, g_bedOrderCooldownMs, g_healThreshold,
         g_stayInBed ? 1 : 0, g_clearBedOrder ? 1 : 0, g_skipCombat ? 1 : 0);
     Log(LC_INIT, "[cfg 재적용] forceBed=%.1f bedMult=%.2f getUpMult=%.2f debug=%d dumpParts=%d dumpHex=%d probeOrder=%d logLimit=%d",
         g_forceBed, g_bedMult, g_getUpMult, g_debug ? 1 : 0,
@@ -839,6 +852,9 @@ static void WriteConfigSnapshot()
     fprintf(f, "                      # 회복되면 clearBedOrder 가 알아서 풀어준다.\n");
     fprintf(f, "                      # v38 부터 기본 1 (인게임 검증 완료).\n");
     fprintf(f, "bedOrderCooldownMs=%d # 같은 사람에게 다시 낼 때까지 최소 간격.\n", g_bedOrderCooldownMs);
+    fprintf(f, "respectMoveOrder=%d  # 플레이어 이동 명령이 진행 중이면 침대로 보내지 않는다.\n", g_respectMoveOrder ? 1 : 0);
+    fprintf(f, "ignoreRobotParts=%d  # 회복 판정에서 로봇 부위를 뺀다. 로봇은 수리 대상이라 일반 침대로 낫지 않는다.\n", g_ignoreRobotParts ? 1 : 0);
+    fprintf(f, "stuckRelease=%.0f    # 침대에서 이 시간(초) 회복이 없으면 명령을 풀어준다. 0=끔.\n", g_stuckRelease);
     fprintf(f, "                      # 짧으면 경로탐색이 계속 초기화돼 출발을 못 한다.\n\n");
     fprintf(f, "probeOrder=%d          # 우클릭 명령 인자와 침대를 기록 (debug=0 에도)\n\n", g_probeOrder ? 1 : 0);
 
@@ -1010,6 +1026,8 @@ static float WorstPartRatio(MedicalSystem* med, bool* ok)
     if (n <= 0 || n > 64) return 1.0f;
 
     float worst = 1.0f;
+    int   skippedRobot = 0;
+    int   counted = 0;
     for (int i = 0; i < n; ++i)
     {
         MedicalSystem::HealthPartStatus* part = med->getPart((unsigned __int64)i);
@@ -1018,10 +1036,26 @@ static float WorstPartRatio(MedicalSystem* med, bool* ok)
         // 실측 대조: 머리 화면 9 -> 0.09, 복부 58 -> 0.59, 기상 후 머리 51 -> 0.51.
         // 예전에 쓰던 flesh/maxHealth 는 전혀 다른 값이었다
         // (화면 9%일 때 79/100 이었고, 도로롱은 217/200 처럼 최대치를 넘겼다).
+        // v40: 로봇 부위는 회복 판정에서 뺀다.
+        // 로봇 부위는 "치료"가 아니라 "수리"다 — 절단 피해는 수리 키트로 그 자리에서
+        // 고치고, 마모(최대치 감소)는 스켈레톤 수리 침대에서만 고쳐진다.
+        // 일반 침대로는 어느 쪽도 낫지 않으므로, 이걸 회복 조건에 넣으면
+        // 스켈레톤과 의수 단 캐릭터가 침대에서 영영 못 나온다 (창작마당 신고).
+        if (g_ignoreRobotParts)
+        {
+            bool rob = false;
+            __try { rob = part->isRobotic(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { rob = false; }
+            if (rob) { ++skippedRobot; continue; }
+        }
+
         float r = *(const float*)((const unsigned char*)part + 0x60);
         if (r < -0.01f || r > 1.05f) return 1.0f;      // 오프셋 의심
         if (r < worst) worst = r;
+        ++counted;
     }
+    // 살 부위가 하나도 없다 = 스켈레톤. 일반 침대로 보낼 이유가 없다.
+    if (counted == 0 && skippedRobot > 0) { *ok = true; return 1.0f; }
     *ok = true;
     return worst;
 }
@@ -1719,6 +1753,9 @@ typedef void (*Update4Fn)(AI*, float);
 static Update4Fn origUpdate4 = 0;
 static int g_tick[MAXCH] = { 0 };
 static int g_injCount[MAXCH] = { 0 };
+static float            g_stuckAccum[MAXCH] = { 0 };   // 회복 없이 누적된 시간(초)
+static unsigned __int64 g_stuckLast[MAXCH]  = { 0 };   // 직전 점검 시각 (간격 계산용)
+static float            g_stuckBase[MAXCH]  = { 0 };   // 기준이 된 최저 부위값
 
 // 슬롯을 재사용할 때 이전 캐릭터의 흔적을 지운다 (CharName 의 축출 경로가 부른다).
 // hookGetUp / DumpPartsOnce 의 함수 내부 "한 번만" 플래그는 못 지우지만
@@ -1732,6 +1769,7 @@ static void ResetSlot(int s)
     g_tick[s] = 0;  g_injCount[s] = 0;  g_skipLogged[s] = 0;
     g_bedOf[s] = 0; g_lastOrder[s] = 0;   // v34
     g_inBed[s] = false; g_inBedTick[s] = 0; g_orderCount[s] = 0;   // v35
+    g_stuckAccum[s] = 0.0f; g_stuckLast[s] = 0; g_stuckBase[s] = -1.0f;   // v40
 }
 
 static void hookUpdate4(AI* self, float t)
@@ -1777,6 +1815,53 @@ static void hookUpdate4(AI* self, float t)
             // 회복된 뒤 그 표시가 있을 때만 해제한다.
             bool hasBedOrder = ts0 && ts0->hasPlayerOrder((TaskType)258);
 
+            // v40 안전밸브: 침대에 누워 있는데 회복이 전혀 오르지 않으면 놓아준다.
+            // 로봇 부위는 위에서 제외했지만, 우리가 모르는 "안 낫는 상황"이 또 있을 수
+            // 있다 (마모는 최대치를 깎고 체력바에 안 보인다). 갇히는 것만은 막는다.
+            if (g_stuckRelease > 0.0f && ts0 && g_injured[s] && hasBedOrder && m)
+            {
+                bool wok = false;
+                float wnow = WorstPartRatio(m, &wok);
+                unsigned __int64 tnow = GetTickCount64();
+
+                // 흐른 시간을 조각으로 누적한다. 벽시계 차이를 그대로 쓰면
+                // 게임을 일시정지하거나 세이브를 부르는 동안에도 시간이 흘러,
+                // 재개하는 순간 곧바로 명령이 풀린다. 한 번에 2초를 넘는 간격은
+                // "게임이 멈춰 있던 구간"으로 보고 세지 않는다.
+                float dt = 0.0f;
+                if (g_stuckLast[s] != 0 && tnow >= g_stuckLast[s])
+                {
+                    float gap = (float)(tnow - g_stuckLast[s]) / 1000.0f;
+                    if (gap <= 2.0f) dt = gap;
+                }
+                g_stuckLast[s] = tnow;
+
+                if (!wok) { /* 못 읽으면 판정하지 않는다 */ }
+                else if (g_stuckBase[s] < 0.0f || wnow > g_stuckBase[s] + 0.005f)
+                {
+                    g_stuckBase[s] = wnow;      // 처음 보거나 나아지고 있다
+                    g_stuckAccum[s] = 0.0f;
+                }
+                else
+                {
+                    g_stuckAccum[s] += dt;
+                    if (g_stuckAccum[s] > g_stuckRelease)
+                    {
+                        ts0->clearOrders();
+                        g_bedOrderWhileHurt[s] = false;
+                        g_stuckAccum[s] = 0.0f; g_stuckBase[s] = -1.0f; g_stuckLast[s] = 0;
+                        Log(LC_ORDER, "[%s] %.0f초간 회복 없음 (최저=%.2f) — 침대 명령 해제",
+                            tmp, g_stuckRelease, wnow);
+                    }
+                }
+            }
+            if (!hasBedOrder)
+            { g_stuckAccum[s] = 0.0f; g_stuckBase[s] = -1.0f; g_stuckLast[s] = 0; }
+
+            // v39: 플레이어가 낸 이동 명령(29 MOVE_CUS_ORDERED)이 아직 남아 있는가.
+            // 남아 있으면 그 사람은 "가라고 시킨 곳"으로 가는 중이므로 건드리지 않는다.
+            bool hasMoveOrder = ts0 && ts0->hasPlayerOrder((TaskType)29);
+
             if (g_injured[s] && hasBedOrder)
                 g_bedOrderWhileHurt[s] = true;      // 다친 채로 눕혔다 — 나중에 풀어준다
 
@@ -1804,7 +1889,14 @@ static void hookUpdate4(AI* self, float t)
             //  명령을 매 프레임 다시 내면 경로탐색이 계속 초기화돼
             //  캐릭터가 아예 출발하지 못한다.
             // ---------------------------------------------------------------
+            // v39 진단: 이동 명령 때문에 보류했다는 사실을 남긴다.
+            // 이 줄이 안 찍히면 hasPlayerOrder(29) 가 이동 중에 참이 아니라는 뜻이고,
+            // 그러면 이 수정은 효과가 없다 — 다른 방법을 찾아야 한다.
+            if (g_debug && g_autoBedOrder && g_injured[s] && hasMoveOrder && !hasBedOrder)
+                Log(LC_ORDER, "[%s] 이동 명령 진행 중 — 침대 명령 보류", tmp);
+
             if (g_autoBedOrder && pc && ts0 && g_injured[s] && !hasBedOrder
+                && !(g_respectMoveOrder && hasMoveOrder)
                 && !g_selected[s] && Eligible(self))
             {
                 unsigned __int64 now = GetTickCount64();
@@ -1979,8 +2071,8 @@ void startPlugin()
         g_skipCombat ? 1 : 0, g_skipSelected ? 1 : 0, g_pauseJobs ? 1 : 0,
         g_logLimit, g_debug ? 1 : 0);
     Log(LC_INIT, "  probeOrder=%d  (1이면 우클릭 명령 인자와 침대를 debug=0 에도 기록)", g_probeOrder ? 1 : 0);
-    Log(LC_INIT, "  autoBedOrder=%d  bedOrderCooldownMs=%d  %s",
-        g_autoBedOrder ? 1 : 0, g_bedOrderCooldownMs,
+    Log(LC_INIT, "  autoBedOrder=%d  respectMoveOrder=%d  ignoreRobotParts=%d  stuckRelease=%.0f  bedOrderCooldownMs=%d  %s",
+        g_autoBedOrder ? 1 : 0, g_respectMoveOrder ? 1 : 0, g_ignoreRobotParts ? 1 : 0, g_stuckRelease, g_bedOrderCooldownMs,
         g_autoBedOrder ? "(다친 아군에게 침대 명령을 대신 낸다)" : "(꺼짐)");
 
     Install("GoToBed",
